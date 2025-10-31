@@ -44,13 +44,3 @@ It allows users to input a page reference string and frame count, then watch ani
 
 ---
 
-## 📂 Project Structure
-
-/os-page-visualizer
-│
-├── index.html # Main entry point (UI layout)
-├── style.css # Custom styles
-├── main.js # Initialization and control logic
-├── algorithms.js # FIFO, LRU, and Optimal algorithm implementations
-├── simulation.js # Simulation and animation engine
-└── ui.js # UI rendering and user interactions
