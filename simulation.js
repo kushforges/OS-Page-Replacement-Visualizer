@@ -8,251 +8,380 @@
  */
 
 // Import the algorithm functions
-import { runFifo, runLru, runOptimal } from './algorithms.js';
+import { fifoStep,lruStep,optimalStep } from './algorithms.js';
 
-// 1.Simulation State Variables
-// These are the "global" state for the simulation
-let frames = [];
-let pageList = [];
-let pageIndex = 0;
-let faults = 0;
-let hits = 0;
-let isFinished = false;
-let lastEvent = { type: 'IDLE' };
-
-// Algorithm-specific state
-let currentAlgo = 'fifo';
-let fifoPointer = 0;
-let lruQueue = [];
-
-
-// 2.Core Simulation Functions
-
-// Sets up the simulation state. Called by main.js
-export function setupSim(algo, numFrames, pageString) {
-    // Parse the page string into a list of numbers
-    pageList = pageString.split(',')
-                         .map(s => s.trim())
-                         .filter(s => s.length > 0)
-                         .map(s => parseInt(s));
+// Main controller class for the simulation
+export class SimulationController{
     
-    // Reset all state variables
-    currentAlgo = algo;
-    frames = new Array(numFrames).fill(null);
-    pageIndex = 0;
-    faults = 0;
-    hits = 0;
-    isFinished = false;
-    lastEvent = { type: 'START' };
-    
-    // Reset algo-specific state
-    fifoPointer = 0;
-    lruQueue = [];
-}
-
-// Resets the simulation
-export function resetSim() {
-    frames = [];
-    pageList = [];
-    pageIndex = 0;
-    faults = 0;
-    hits = 0;
-    isFinished = true; // Set to true to stop loop
-    lastEvent = { type: 'IDLE' };
-}
-
-// Runs one step of the simulation
-export function stepForward() {
-    if (isFinished || pageIndex >= pageList.length) {
-        isFinished = true;
-        lastEvent = { type: 'DONE' };
-        return;
-    }
-
-    // 1.Get the current page
-    const currentPage = pageList[pageIndex];
-
-    // 2.Run the correct algorithm
-    let result;
-    if (currentAlgo === 'fifo') {
-        result = runFifo(frames, fifoPointer, currentPage);
-        fifoPointer = result.fifoPointer; // Update pointer
+    /**
+     * @param {HTMLCanvasElement} canvas - The canvas element to draw on.
+     * @param {string} algo - The selected algorithm ('fifo', 'lru', 'optimal').
+     * @param {number} numFr - The number of physical memory frames.
+     * @param {number[]} pgStr - The array of page requests.
+     */
+    constructor(canvas,algo,numFr,pgStr) {
+        this.canvas=canvas;
+        this.ctx=canvas.getContext('2d');
+        this.algorithm=algo;
+        this.numFrames=numFr;
+        this.pageString=pgStr;
         
-    } else if (currentAlgo === 'lru') {
-        result = runLru(frames, lruQueue, currentPage);
-        lruQueue = result.lruQueue; // Update queue
+        this.stateHistory=[]; // Stores snapshots for step-back
+        this.currentState=null;
+        this.isFinished=false;
+
+        this.initState();
+        this.recordState(); // Save the initial state
         
-    } else if (currentAlgo === 'optimal') {
-        const futurePages = pageList.slice(pageIndex + 1);
-        result = runOptimal(frames, currentPage, futurePages);
-    }
-
-    // 3.Update state with the result
-    frames = result.newFrames;
-    lastEvent = result.event;
-
-    if (lastEvent.type === 'HIT') {
-        hits++;
-    } else if (lastEvent.type === 'FAULT') {
-        faults++;
+        // Add a resize listener
+        this.resizeObs=new ResizeObserver(() => this.resizeCanvas());
+        this.resizeObs.observe(this.canvas.parentElement);
+        this.resizeCanvas(); // Initial resize
     }
     
-    // 4.Move to the next page
-    pageIndex++;
-    
-    // 5.Check if we're done
-    if (pageIndex >= pageList.length) {
-        isFinished = true;
-        lastEvent = { type: 'DONE' };
+    // Cleans up listeners when the simulation is reset
+    destroy(){
+        this.resizeObs.disconnect();
     }
-}
 
-// Lets main.js get the current state for the UI
-export function getSimState() {
-    return {
-        faults,
-        hits,
-        lastEvent,
-        isFinished
-    };
-}
+    // Resizes the canvas to fit its container and recalculates coordinates
+    resizeCanvas(){
+        const container=this.canvas.parentElement;
+        if (!container) return;
+        
+        // Set internal canvas resolution
+        this.canvas.width=container.clientWidth;
+        this.canvas.height=500; 
+        
+        // Recalculate coordinates based on new size
+        this.calculateCoordinates();
+        // Redraw immediately
+        this.draw(); 
+    }
 
 
-// 3.Canvas Drawing Function
+    // Sets up the initial state of the simulation
+    initState(){
+        this.currentState={
+            // Core Logic State
+            frames: new Array(this.numFrames).fill(null), // Physical memory
+            pageIndex:0,           // Current position in pageString
+            stats:{
+                pageFaults:0,
+                pageHits:0
+            },
+            
+            // Algorithm-specific state
+            // For FIFO:
+            fifoPointer:0,
+            // For LRU:
+            lruQueue:[], // Stores pages in order of use (most recent at end)
 
-// Draws the entire simulation state onto the canvas
-export function drawSim(canvas, ctx) {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+            // UI / Animation State
+            lastEvent:{
+                type:'START', // 'START', 'HIT', 'FAULT', 'DONE'
+                page:null,
+                replaced:null
+            },
+            
+            // Drawing coordinates (calculated once)
+            coords:{} // Will be populated by calculateCoordinates
+        };
+        this.isFinished=false;
+        this.stateHistory=[];
+    }
     
-    // Set up drawing styles
-    ctx.font = "bold 16px Inter";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
+    /**
+     * Calculates and stores all coordinates for drawing.
+     * This improves performance by not recalculating on every frame.
+     */
+    calculateCoordinates(){
+        const coords={
+            frames:[],
+            pageString:[],
+            pageStringLabel:{x:0,y:0},
+            framesLabel:{x:0,y:0},
+            pointer:{}
+        };
 
-    // 1.Draw Memory Frames
-    const frameBoxWidth = 80;
-    const frameBoxHeight = 50;
-    const frameStartX = (canvas.width / 2) - (frameBoxWidth / 2);
-    const frameStartY = 60;
-    const frameSpacing = 20;
+        const canvasWidth=this.canvas.width;
+        const canvasHeight=this.canvas.height;
+        
+        const topMargin=60;
+        const bottomMargin=120;
+        
+        // Page String Coordinates
+        const pgBoxSz=40;
+        const pgBoxPd=10;
+        const pgStrTotalWd=this.pageString.length*(pgBoxSz+pgBoxPd)-pgBoxPd;
+        let pageStringStartX=(canvasWidth-pgStrTotalWd)/2;
 
-    ctx.font = "14px Inter";
-    ctx.textAlign = "right";
-    ctx.fillStyle = "#475569";
-    ctx.fillText("Memory Frames:", frameStartX - 10, frameStartY - 20);
-
-    for (let i = 0; i < frames.length; i++) {
-        const x = frameStartX;
-        const y = frameStartY + i * (frameBoxHeight + frameSpacing);
-        const page = frames[i];
+        if (pageStringStartX<30) pageStringStartX=30;
+    
+        const pageStringY=canvasHeight-bottomMargin+40;
+        coords.pageStringLabel={x:Math.max(30,pageStringStartX),y:pageStringY-20};
         
-        // Highlight hit/fault
-        if (lastEvent.type === 'HIT' && page === lastEvent.page) {
-            ctx.fillStyle = "#dcfce7"; // green
-            ctx.strokeStyle = "#22c55e";
-        } else if (lastEvent.type === 'FAULT' && i === lastEvent.frameIndex) {
-            ctx.fillStyle = "#fee2e2"; // red
-            ctx.strokeStyle = "#ef4444";
-        } else {
-            ctx.fillStyle = "#ffffff";
-            ctx.strokeStyle = "#94a3b8";
-        }
-        
-        ctx.lineWidth = 2;
-        ctx.fillRect(x, y, frameBoxWidth, frameBoxHeight);
-        ctx.strokeRect(x, y, frameBoxWidth, frameBoxHeight);
-        
-        // Draw page number
-        if (page !== null) {
-            ctx.fillStyle = "#1e293b";
-            ctx.font = "bold 20px Inter";
-            ctx.textAlign = "center";
-            ctx.fillText(page, x + frameBoxWidth / 2, y + frameBoxHeight / 2);
+        for (let i=0;i<this.pageString.length;i++){
+            coords.pageString.push({
+                x:pageStringStartX+i*(pgBoxSz+pgBoxPd),
+                y:pageStringY,
+                w:pgBoxSz,
+                h:pgBoxSz
+            });
         }
 
-        // Draw frame label
-        ctx.fillStyle = "#475569";
-        ctx.font = "14px Inter";
-        ctx.textAlign = "right";
-        ctx.fillText(`Frame ${i}:`, x - 10, y + frameBoxHeight / 2);
+        // Memory Frames Coordinates
+        const frameWidth=100;
+        const frameHeight=60;
+        const framePadding=20;
+        const frameStartX=(canvasWidth/2)-50; 
+        const frameStartY=topMargin+40;
+        coords.framesLabel={x:frameStartX-framePadding,y:frameStartY-20};
         
-        // Draw FIFO pointer
-        if (currentAlgo === 'fifo' && i === fifoPointer && !isFinished) {
-            ctx.fillStyle = "#0284c7";
-            ctx.textAlign = "left";
-            ctx.fillText("➔ Next", x + frameBoxWidth + 10, y + frameBoxHeight / 2);
+        for (let i=0;i<this.numFrames;i++){
+            coords.frames.push({
+                x:frameStartX,
+                y:frameStartY+i*(frameHeight+framePadding),
+                w:frameWidth,
+                h:frameHeight,
+                labelX:frameStartX-framePadding,
+                labelY:frameStartY+i*(frameHeight+framePadding)+(frameHeight/2)
+            });
         }
-        // Draw LRU tags
-        if (currentAlgo === 'lru' && page !== null) {
-            ctx.fillStyle = "#64748b";
-            ctx.font = "12px Inter";
-            ctx.textAlign = "left";
-            if(lruQueue.indexOf(page) === 0) {
-                 ctx.fillText("(LRU)", x + frameBoxWidth + 10, y + frameBoxHeight / 2);
+        
+        // Pointer coordinates
+        coords.pointer.x=frameStartX+frameWidth+framePadding;
+        
+        // Store coordinates in the state
+        if (this.currentState){
+            this.currentState.coords=coords;
+        }
+        return coords;
+    }
+
+    // Saves a deep copy of the current state for history
+    recordState(){
+        // Simple deep copy using JSON
+        const stateCopy=JSON.parse(JSON.stringify(this.currentState));
+        // We don't need to copy coords every time
+        stateCopy.coords=this.currentState.coords; 
+        this.stateHistory.push(stateCopy);
+    }
+
+    // The main logic tick. Calls the correct algorithm step
+    stepForward(){
+        if (this.isFinished) return;
+
+        // Check if simulation is done
+        if (this.currentState.pageIndex>=this.pageString.length) {
+            this.isFinished=true;
+            this.currentState.lastEvent={type:'DONE',page:null,replaced:null};
+            this.recordState();
+            return;
+        }
+
+        // Get the current page
+        const currentPage=this.pageString[this.currentState.pageIndex];
+        
+        // Create a deep copy of the state to pass to the pure function
+        const stateToProcess=JSON.parse(JSON.stringify(this.currentState));
+        
+        // Call the appropriate algorithm function
+        let result;
+        switch (this.algorithm){
+            case 'fifo':
+                result=fifoStep(stateToProcess,currentPage);
+                break;
+            case 'lru':
+                result=lruStep(stateToProcess,currentPage);
+                break;
+            case 'optimal':
+                // Optimal needs to look ahead in the page string
+                const futureString=this.pageString.slice(this.currentState.pageIndex+1);
+                result=optimalStep(stateToProcess,currentPage,futureString);
+                break;
+        }
+
+        // Update the state with the result from the algorithm
+        // We must re-assign coords as they are not part of the deep copy
+        result.coords=this.currentState.coords;
+        this.currentState=result;
+        
+        // Move to the next page
+        this.currentState.pageIndex++;
+        
+        // Save this new state
+        this.recordState();
+    }
+
+    // Reverts to the previous state in history
+    stepBackward(){
+        if (this.stateHistory.length>1) {
+            this.stateHistory.pop(); // Remove current state
+            const prevState=this.stateHistory[this.stateHistory.length-1];
+            // Create a deep copy to avoid mutation issues
+            this.currentState=JSON.parse(JSON.stringify(prevState));
+            this.currentState.coords=prevState.coords; 
+            this.isFinished=false;
+        }
+    }
+
+    // The main drawing function
+    draw() {
+        // Clear canvas
+        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+
+        const state = this.currentState;
+        if (!state || !state.coords || !state.coords.framesLabel) {
+            return;
+        }
+        
+        const coords = state.coords;
+        const lastEvent = state.lastEvent;
+
+        // 1.Draw Page Reference String 
+        this.ctx.font = "14px Inter";
+        this.ctx.fillStyle = "#475569";
+        this.ctx.textAlign = "left";
+        this.ctx.textBaseline = "bottom";
+        this.ctx.fillText("Page Reference String:", coords.pageStringLabel.x, coords.pageStringLabel.y);
+        
+        this.ctx.font = "bold 16px Inter";
+        this.ctx.textAlign = "center";
+        this.ctx.textBaseline = "middle";
+
+        for (let i = 0; i < this.pageString.length; i++) {
+            const c = coords.pageString[i];
+            // If coords are off-canvas (e.g., during resize), skip drawing
+            if (!c) continue; 
+            
+            if (i < state.pageIndex -1) { // Already processed
+                this.ctx.fillStyle = "#f1f5f9";
+                this.ctx.strokeStyle = "#e2e8f0";
+            } else if (i === state.pageIndex - 1) { // Just processed
+                if(lastEvent.type === 'HIT') this.ctx.fillStyle = "#dcfce7";
+                else if(lastEvent.type === 'FAULT') this.ctx.fillStyle = "#fee2e2";
+                else this.ctx.fillStyle = "#f1f5f9";
+                this.ctx.strokeStyle = "#94a3b8";
+            } else if (i === state.pageIndex) { // Current page
+                this.ctx.fillStyle = "#dbeafe";
+                this.ctx.strokeStyle = "#3b82f6";
+            } else { // Future pages
+                this.ctx.fillStyle = "#ffffff";
+                this.ctx.strokeStyle = "#cbd5e1";
             }
-            if(lruQueue.indexOf(page) === lruQueue.length - 1) {
-                 ctx.fillText("(MRU)", x + frameBoxWidth + 10, y + frameBoxHeight / 2);
+            
+            this.ctx.lineWidth = (i === state.pageIndex) ? 2 : 1;
+            this.ctx.beginPath();
+            this.ctx.rect(c.x, c.y, c.w, c.h);
+            this.ctx.fill();
+            this.ctx.stroke();
+            
+            // Text color
+            if (i < state.pageIndex) this.ctx.fillStyle = "#94a3b8";
+            else this.ctx.fillStyle = "#1e293b";
+            this.ctx.fillText(this.pageString[i], c.x + c.w / 2, c.y + c.h / 2);
+        }
+        
+        // Draw "Current Page" arrow
+        if (!this.isFinished && coords.pageString[state.pageIndex]) {
+            const currentBox = coords.pageString[state.pageIndex];
+            const arrowX = currentBox.x + currentBox.w / 2;
+            const arrowY = currentBox.y - 10;
+            this.ctx.fillStyle = "#3b82f6";
+            this.ctx.beginPath();
+            this.ctx.moveTo(arrowX, arrowY);
+            this.ctx.lineTo(arrowX - 6, arrowY - 10);
+            this.ctx.lineTo(arrowX + 6, arrowY - 10);
+            this.ctx.closePath();
+            this.ctx.fill();
+        }
+
+        // 2.Draw Memory Frames
+        this.ctx.font = "14px Inter";
+        this.ctx.fillStyle = "#475569";
+        this.ctx.textAlign = "right";
+        this.ctx.textBaseline = "bottom";
+        this.ctx.fillText("Memory Frames:", coords.framesLabel.x, coords.framesLabel.y);
+        
+        this.ctx.font = "bold 20px Inter";
+        this.ctx.textAlign = "center";
+        this.ctx.textBaseline = "middle";
+
+        for (let i = 0; i < this.numFrames; i++) {
+            const c = coords.frames[i];
+            if (!c) continue; // Skip if coords not ready
+            
+            const page = state.frames[i];
+            
+            // Determine style based on last event
+            if (lastEvent.type === 'HIT' && page === lastEvent.page) {
+                // Highlight HIT
+                this.ctx.fillStyle = "#dcfce7";
+                this.ctx.strokeStyle = "#22c55e";
+            } else if (lastEvent.type === 'FAULT' && i === lastEvent.replacedFrameIndex) {
+                 // Highlight FAULT (new page)
+                 this.ctx.fillStyle = "#fee2e2";
+                 this.ctx.strokeStyle = "#ef4444";
+            } else {
+                // Default
+                this.ctx.fillStyle = "#ffffff";
+                this.ctx.strokeStyle = "#94a3b8";
+            }
+            
+            this.ctx.lineWidth = 2;
+            this.ctx.beginPath();
+            this.ctx.rect(c.x, c.y, c.w, c.h);
+            this.ctx.fill();
+            this.ctx.stroke();
+            
+            // Draw page number
+            if (page !== null) {
+                this.ctx.fillStyle = "#1e293b";
+                this.ctx.fillText(page, c.x + c.w / 2, c.y + c.h / 2);
+            } else {
+                this.ctx.fillStyle = "#cbd5e1";
+                this.ctx.fillText("-", c.x + c.w / 2, c.y + c.h / 2);
+            }
+            
+            // Draw Frame Label
+            this.ctx.font = "14px Inter";
+            this.ctx.fillStyle = "#475569";
+            this.ctx.textAlign = "right";
+            this.ctx.fillText(`Frame ${i}:`, c.labelX, c.labelY);
+        }
+        
+        // 3.Draw Algorithm-Specific Pointers
+        this.ctx.font = "bold 14px Inter";
+        this.ctx.textAlign = "left";
+        this.ctx.textBaseline = "middle";
+        
+        if (this.algorithm === 'fifo' && !this.isFinished) {
+            const c = coords.frames[state.fifoPointer];
+            if (c) { // Check if coords are ready
+                const pointerY = c.labelY;
+                this.ctx.fillStyle = "#0284c7";
+                this.ctx.fillText("Next ➔", coords.pointer.x, pointerY);
             }
         }
-    }
-
-    // 2.Draw Page String
-    const pageBoxSize = 40;
-    const pageSpacing = 10;
-    const pageStringTotalWidth = pageList.length * (pageBoxSize + pageSpacing) - pageSpacing;
-    let pageStringStartX = (canvas.width - pageStringTotalWidth) / 2;
-    if (pageStringStartX < 20) pageStringStartX = 20;
-    
-    const pageStringY = canvas.height - 80;
-
-    ctx.font = "14px Inter";
-    ctx.textAlign = "left";
-    ctx.fillStyle = "#475569";
-    ctx.fillText("Page String:", pageStringStartX, pageStringY - 20);
-    
-    for (let i = 0; i < pageList.length; i++) {
-        const x = pageStringStartX + i * (pageBoxSize + pageSpacing);
-        const y = pageStringY;
         
-        // Style box based on position
-        if (i < pageIndex) { // Processed
-            ctx.fillStyle = "#f1f5f9";
-            ctx.strokeStyle = "#e2e8f0";
-        } else if (i === pageIndex) { // Current
-            ctx.fillStyle = "#dbeafe";
-            ctx.strokeStyle = "#3b82f6";
-        } else { // Future
-            ctx.fillStyle = "#ffffff";
-            ctx.strokeStyle = "#cbd5e1";
+        if (this.algorithm === 'lru') {
+            this.ctx.font = "12px Inter";
+            this.ctx.fillStyle = "#64748b";
+            for (let i = 0; i < this.numFrames; i++) {
+                const c = coords.frames[i];
+                if (!c) continue; // Check if coords are ready
+                
+                const page = state.frames[i];
+                if (page !== null) {
+                    const lruIndex = state.lruQueue.indexOf(page);
+                    let lruText = '';
+                    if (lruIndex === 0) lruText = "(LRU)";
+                    if (lruIndex === state.lruQueue.length - 1) lruText = "(MRU)";
+                    this.ctx.fillText(lruText, coords.pointer.x, c.labelY);
+                }
+            }
         }
-        
-        ctx.lineWidth = (i === pageIndex) ? 2 : 1;
-        ctx.fillRect(x, y, pageBoxSize, pageBoxSize);
-        ctx.strokeRect(x, y, pageBoxSize, pageBoxSize);
-        
-        // Text color
-        if (i < pageIndex) {
-            ctx.fillStyle = "#94a3b8";
-        } else {
-            ctx.fillStyle = "#1e293b";
-        }
-        ctx.font = "bold 16px Inter";
-        ctx.textAlign = "center";
-        ctx.fillText(pageList[i], x + pageBoxSize / 2, y + pageBoxSize / 2);
-    }
-    
-    // Draw "Current Page" arrow
-    if (!isFinished && pageList.length > 0 && pageIndex < pageList.length) {
-        const currentBoxX = pageStringStartX + pageIndex * (pageBoxSize + pageSpacing);
-        const arrowX = currentBoxX + pageBoxSize / 2;
-        const arrowY = pageStringY - 10;
-        ctx.fillStyle = "#3b82f6";
-        ctx.beginPath();
-        ctx.moveTo(arrowX, arrowY);
-        ctx.lineTo(arrowX - 6, arrowY - 10);
-        ctx.lineTo(arrowX + 6, arrowY - 10);
-        ctx.closePath();
-        ctx.fill();
     }
 }
 
