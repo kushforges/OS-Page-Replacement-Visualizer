@@ -67,7 +67,7 @@ You must use a **local server** — the easiest way is via the **Live Server** e
 |----------|-----------|
 | **Play / Pause** | Starts or stops the animation. |
 | **Step Forward** | Runs one step of the algorithm manually. |
-| **Step Back** | *(Disabled)* — skipped to keep code simple. |
+| **Step Back** | Moves one step backward to review previous states. |
 | **Animation Speed** | Adjusts the speed of the animation with a slider. |
 | **Reset** | Stops and clears the current simulation. |
 
