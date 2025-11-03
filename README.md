@@ -20,7 +20,8 @@ It allows users to input a page reference string and frame count, then watch ani
 
 - **⏯️ Animation Controls**  
   - **Play / Pause**  
-  - **Step Forward** (manual control)
+  - **Step Forward**
+  - **Step Back**
 
 - **⚡ Adjustable Speed**  
   A **slider** lets you change the animation speed in real time.
